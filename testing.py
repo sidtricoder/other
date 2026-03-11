@@ -179,7 +179,8 @@ class FullBandFloodDataset(Dataset):
             msk_raw = src.read(1)  # (H,W)
 
         # preserve -1; binarize only non-negative labels
-        msk = np.where(msk_raw < 0, -1, (msk_raw > 0).astype(np.uint8))
+        # IMPORTANT: use int16 (signed) so that -1 is not wrapped to 255 by uint8 promotion
+        msk = np.where(msk_raw < 0, np.int16(-1), (msk_raw > 0).astype(np.int16))
 
         # Albumentations expects HWC
         img = np.moveaxis(img, 0, -1)  # (H,W,C)
