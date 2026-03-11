@@ -22,9 +22,11 @@ import csv
 import glob
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn.functional as F
 import rasterio
+from pathlib import Path
 
 import lightning.pytorch as pl
 from torch.utils.data import Dataset, DataLoader
@@ -216,6 +218,17 @@ class FloodTestDataModule(pl.LightningDataModule):
             )
 
     def test_dataloader(self):
+        return DataLoader(
+            self.test_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=NUM_WORKERS,
+            pin_memory=True,
+            persistent_workers=False,
+        )
+
+    def predict_dataloader(self):
+        # Reuse test dataset for prediction
         return DataLoader(
             self.test_dataset,
             batch_size=self.batch_size,
@@ -532,6 +545,22 @@ class IgnoreLabelSegTask(SemanticSegmentationTask):
     def test_step(self, batch, batch_idx):
         return self._step_impl(batch, "test")
 
+    def predict_step(self, batch, batch_idx, dataloader_idx=0):
+        x = batch["image"].float()
+        filenames = batch["filename"]
+        model_out = self.forward(x)
+        logits = self._extract_logits(model_out)
+        # Upsample if needed
+        target_h, target_w = x.shape[-2], x.shape[-1]
+        if logits.shape[-2] != target_h or logits.shape[-1] != target_w:
+            logits = F.interpolate(
+                logits.float(),
+                size=(target_h, target_w),
+                mode="bilinear",
+                align_corners=False,
+            )
+        return logits, filenames
+
 
 # =========================
 # Build + load model
@@ -631,6 +660,70 @@ def main():
             print(f"{k}: {res[k]}")
     else:
         print("[WARN] trainer.test returned no results")
+
+    # 7) Prediction -> GeoTIFF -> RLE CSV
+    print("\n[INFO] Running prediction pass...")
+    predictions = trainer.predict(model=model, datamodule=test_dm)
+
+    output_dir = os.path.join(os.path.dirname(ckpt_path), "predictions")
+    os.makedirs(output_dir, exist_ok=True)
+
+    for preds, file_paths in predictions:
+        if isinstance(preds, tuple):
+            preds = preds[0]
+        if preds.ndim == 4:               # [B, C, H, W]
+            preds = preds.argmax(dim=1)   # [B, H, W]
+        preds = preds.cpu().numpy().astype("int16")
+
+        for i in range(preds.shape[0]):
+            arr = preds[i]
+            arr[arr < 0] = -1
+
+            # Reconstruct original image path from filename
+            ref_path = os.path.join(img_test_dir, file_paths[i])
+            with rasterio.open(ref_path) as src:
+                meta = src.meta.copy()
+
+            meta.update({
+                "count": 1,
+                "dtype": "int16",
+                "nodata": -1,
+                "compress": "lzw",
+            })
+
+            out_name = os.path.splitext(os.path.basename(ref_path))[0] + "_pred.tif"
+            out_path = os.path.join(output_dir, out_name)
+
+            with rasterio.open(out_path, "w", **meta) as dst:
+                dst.write(arr, 1)
+
+            print(f"[INFO] Saved {out_path}")
+
+    # 8) Convert predictions to Kaggle-style RLE submission CSV
+    def mask_to_rle(mask):
+        """Convert binary mask to RLE (Kaggle column-major format)."""
+        pixels = mask.flatten(order="F")
+        pixels = np.concatenate([[0], pixels, [0]])
+        runs = np.where(pixels[1:] != pixels[:-1])[0] + 1
+        runs[1::2] -= runs[::2]
+        return " ".join(str(x) for x in runs)
+
+    rows = []
+    for tif_path in sorted(Path(output_dir).glob("*_pred.tif")):
+        with rasterio.open(tif_path) as src:
+            mask = src.read(1)
+        mask = (mask > 0).astype(np.uint8)
+        rle = mask_to_rle(mask)
+        rows.append({
+            "id": tif_path.name.replace("_pred.tif", ""),
+            "rle_mask": rle,
+        })
+
+    csv_path = os.path.join(output_dir, "submission.csv")
+    df = pd.DataFrame(rows)
+    df = df.replace("", 0).fillna(0)
+    df.to_csv(csv_path, index=False)
+    print(f"\n[INFO] Saved Kaggle RLE CSV: {csv_path}")
 
 
 if __name__ == "__main__":
