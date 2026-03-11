@@ -14,6 +14,7 @@ import os
 # ---------- Force this process to use physical GPU 1 ----------
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"   # physical GPU 1 will appear as cuda:0
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"   # synchronous CUDA errors for cleaner tracebacks
 
 import tarfile
 import time
@@ -461,6 +462,17 @@ class IgnoreLabelSegTask(SemanticSegmentationTask):
 
         model_out = self.forward(x)
         logits = self._extract_logits(model_out)
+
+        # Upsample logits to match target spatial size if needed
+        target_h, target_w = y.shape[-2], y.shape[-1]
+        if logits.shape[-2] != target_h or logits.shape[-1] != target_w:
+            logits = F.interpolate(
+                logits.float(),
+                size=(target_h, target_w),
+                mode="bilinear",
+                align_corners=False,
+            )
+
         loss, valid_mask = self._compute_loss_masked(logits, y)
         preds = torch.argmax(logits, dim=1)
         has_valid = bool(torch.any(valid_mask))
